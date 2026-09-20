@@ -137,7 +137,7 @@ class CountAdapter(FreezableAdapter):
 
     def transform(self) -> int:
         """Retrieve the count."""
-        return self._model.austin.samples_count
+        return self._model.active_austin.samples_count
 
     def update(self, data: int) -> bool:
         """Update the widget."""
@@ -200,11 +200,7 @@ class CurrentThreadAdapter(Adapter):
 
     def transform(self) -> Union[str, AttrString]:
         """Get current thread."""
-        austin = (
-            self._model.frozen_austin or self._model.austin
-            if self._model.frozen
-            else self._model.austin
-        )
+        austin = self._model.active_austin
         n = len(austin.threads)
         if not n:
             return "--/--"
@@ -223,11 +219,7 @@ class ThreadNameAdapter(FreezableAdapter):
 
     def transform(self) -> Union[str, AttrString]:
         """Get the thread name."""
-        austin = (
-            self._model.frozen_austin or self._model.austin
-            if self._model.frozen
-            else self._model.austin
-        )
+        austin = self._model.active_austin
         if austin.threads:
             pid, _, tid = austin.threads[austin.current_thread].partition(":")
             return self._view.markup(
@@ -251,18 +243,10 @@ class BaseThreadDataAdapter(Adapter):
     ) -> TableData: ...
 
     def transform(self) -> TableData:
-        """Transform according to the right model."""
-        austin = (
-            self._model.frozen_austin or self._model.austin
-            if self._model.frozen
-            else self._model.austin
+        """Transform according to the active (live or frozen) revision."""
+        return self._transform(
+            self._model.active_austin, self._model.active_system
         )
-        system = (
-            self._model.frozen_system or self._model.system
-            if self._model.frozen
-            else self._model.system
-        )
-        return self._transform(austin, system)
 
     def update(self, data: TableData) -> bool:
         """Update the table."""
@@ -300,10 +284,7 @@ class ThreadDataAdapter(BaseThreadDataAdapter):
 
         for frame in frames or []:
             child_frame_stats = container[frame]
-            if (
-                child_frame_stats.total / 1e6 / max_scale
-                < self._model.austin.threshold
-            ):
+            if child_frame_stats.total / 1e6 / max_scale < austin.threshold:
                 break
             column = (
                 f":<lineno>{child_frame_stats.label.column}</lineno>"
@@ -360,7 +341,7 @@ class ThreadTopDataAdapter(BaseThreadDataAdapter):
             if len(frame_stats) >= MAX_LENGTH:
                 truncated = True
                 return
-            if stats.total / 1e6 / max_scale < self._model.austin.threshold:
+            if stats.total / 1e6 / max_scale < austin.threshold:
                 return
 
             column = (
@@ -475,9 +456,9 @@ class ThreadFullDataAdapter(BaseThreadDataAdapter):
                 return
             if len(frame_stats) > MAX_LENGTH:
                 return
-            if stats.total / 1e6 / max_scale < self._model.austin.threshold:
+            if stats.total / 1e6 / max_scale < austin.threshold:
                 return
-            if self._model.system.child_process is None:
+            if system.child_process is None:
                 active = True
                 active_bucket = stats.children
             else:
@@ -566,18 +547,10 @@ class FlameGraphAdapter(Adapter):
     """Flame graph data adapter."""
 
     def transform(self) -> dict:
-        """Transform according to the right model."""
-        austin = (
-            self._model.frozen_austin or self._model.austin
-            if self._model.frozen
-            else self._model.austin
+        """Transform according to the active (live or frozen) revision."""
+        return self._transform(  # type: ignore[arg-type]
+            self._model.active_austin, self._model.active_system
         )
-        system = (
-            self._model.frozen_system or self._model.system
-            if self._model.frozen
-            else self._model.system
-        )
-        return self._transform(austin, system)  # type: ignore[arg-type]
 
     def _transform(
         self, austin: AustinModel, system: Union[SystemModel, FrozenSystemModel]

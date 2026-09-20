@@ -21,6 +21,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import time
+from typing import Any
 from typing import Optional
 
 from psutil import NoSuchProcess
@@ -35,11 +36,17 @@ Bytes = int
 class FrozenSystemModel:
     """Frozen system model data."""
 
-    __slots__ = ("duration", "max_memory")
+    __slots__ = ("duration", "max_memory", "child_process")
 
-    def __init__(self, duration: Seconds, max_memory: Bytes) -> None:
+    def __init__(
+        self,
+        duration: Seconds,
+        max_memory: Bytes,
+        child_process: Optional[Any] = None,
+    ) -> None:
         self.duration = duration
         self.max_memory = max_memory
+        self.child_process = child_process
 
 
 class SystemModel:
@@ -100,4 +107,6 @@ class SystemModel:
 
     def freeze(self) -> FrozenSystemModel:
         """Freeze the model data."""
-        return FrozenSystemModel(self.duration, self.max_memory)
+        return FrozenSystemModel(
+            self.duration, self.max_memory, self.child_process
+        )

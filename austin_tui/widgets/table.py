@@ -42,6 +42,9 @@ class Table(Widget):
 
         self._cols = int(columns)
         self._data: TableData = []
+        # The table is drawn from scratch only when its data changed or when
+        # it is resized. Repeated refresh ticks must not redraw row by row.
+        self._data_dirty = True
 
     def _show_empty(self) -> bool:
         if self.win is None:
@@ -82,6 +85,7 @@ class Table(Widget):
         if data != self._data:
             self._data = data
             self._height = len(data)
+            self._data_dirty = True
             assert self.parent is not None
             self.parent.resize(self.parent.rect)
             return True
@@ -95,19 +99,26 @@ class Table(Widget):
 
         self.rect = rect
 
-        self.draw()
+        self.draw(force=True)
 
         return True
 
-    def draw(self) -> bool:
-        """Draw the table."""
+    def draw(self, force: bool = False) -> bool:
+        """Draw the table.
+
+        A no-op unless the data changed since the last draw or ``force`` is
+        passed (e.g. after a resize).
+        """
         super().draw()
 
         if not self.win:
             return False
 
+        if not force and not self._data_dirty:
+            return False
+
         if not self._data:
-            return self._show_empty()
+            drawn = self._show_empty()
         else:
             win = self.win.get_win()
             if not win:
@@ -115,5 +126,7 @@ class Table(Widget):
             win.clear()
             for i, e in enumerate(self._data, self.pos.y):
                 self._draw_row(i, e)
+            drawn = True
 
-        return True
+        self._data_dirty = False
+        return drawn

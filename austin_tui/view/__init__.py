@@ -22,6 +22,7 @@
 
 import asyncio
 import curses
+import functools
 import sys
 from collections import defaultdict
 from typing import Any
@@ -106,6 +107,14 @@ class View:
         self.root_widget = None
 
         self._input_task = None
+
+        # Markup expansion is a pure function of the source string (the
+        # palette is static for the whole lifetime of the view). Memoising it
+        # avoids re-parsing XML for every cell on every table rebuild, which
+        # dominates the cost of refreshing high-cardinality views.
+        self.markup = functools.lru_cache(maxsize=1 << 14)(  # type: ignore[method-assign]
+            self.markup
+        )
 
     def on_exception(self, exc: Exception) -> None:
         """Default task exception callback.

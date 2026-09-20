@@ -43,6 +43,9 @@ class FlameGraph(Widget):
         self._data: Optional[dict] = None
         self._height = 40
         self._palette: Optional[Tuple[List[int], List[int]]] = None
+        # The graph is traversed and drawn again only when its data changed or
+        # when it is resized; quiet refresh ticks are cheap no-ops.
+        self._data_dirty = True
 
     def set_palette(self, palette: Tuple[List[int], List[int]]) -> None:
         """Set the flame graph palette."""
@@ -55,7 +58,7 @@ class FlameGraph(Widget):
 
         self.rect = rect
 
-        self.draw()
+        self.draw(force=True)
 
         return True
 
@@ -76,6 +79,7 @@ class FlameGraph(Widget):
 
         if data != self._data:
             self._data = data
+            self._data_dirty = True
 
             w = self.size.x
             for _, (v, _) in self._data.items():
@@ -122,11 +126,18 @@ class FlameGraph(Widget):
                 _text = text
             win.addstr(y, x, " " + _text, color)
 
-    def draw(self) -> bool:
-        """Draw the graph."""
+    def draw(self, force: bool = False) -> bool:
+        """Draw the graph.
+
+        A no-op unless the data changed since the last draw or ``force`` is
+        passed (e.g. after a resize).
+        """
         super().draw()
 
         if not self.win or not self._data:
+            return False
+
+        if not force and not self._data_dirty:
             return False
 
         assert self.win is not None
@@ -150,4 +161,5 @@ class FlameGraph(Widget):
                 levels.append((x + i, y + 1, (k, c)))
                 i += int(c[0] * scale + 0.5)
 
+        self._data_dirty = False
         return True

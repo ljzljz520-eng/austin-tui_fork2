@@ -20,10 +20,13 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import functools
 from enum import Enum
 from typing import Any
 from typing import Callable
+from typing import Dict
 from typing import Optional
+from typing import Tuple
 
 from austin_tui import AustinProfileMode
 from austin_tui.adapters import fmt_time as _fmt_time
@@ -69,6 +72,17 @@ class AustinView(View):
         self._stopped = False
 
         self.view_mode = AustinViewMode.LIVE
+
+        # Formatted values are deterministic for the view lifetime, so cache
+        # their attribute strings. This keeps high-cardinality table rebuilds
+        # within the interactive latency budget.
+        self.fmt_time = functools.lru_cache(maxsize=1 << 12)(  # type: ignore[method-assign]
+            self.fmt_time
+        )
+        self.fmt_mem = functools.lru_cache(maxsize=1 << 12)(  # type: ignore[method-assign]
+            self.fmt_mem
+        )
+        self._scaler_cache: Dict[Tuple[float, int, bool], AttrStringChunk] = {}
 
     def on_exception(self, exc: Exception) -> None:
         """The on exception Austin view handler."""
@@ -241,9 +255,17 @@ class AustinView(View):
         return self.palette.get_color(prefix + "100")
 
     def _scaler(self, ratio: float, active: bool) -> AttrStringChunk:
-        return AttrStringChunk(
-            f"{min(100, ratio):6.1f}% ", color=self.color_level(ratio, active)
-        )
+        ratio = min(100.0, ratio)
+        color = self.color_level(ratio, active)
+        # Round to the displayed precision so that the same rendered chunk is
+        # reused even when the underlying ratio drifts slightly between
+        # revisions (e.g. as the elapsed duration grows).
+        key = (round(ratio, 1), color, active)
+        chunk = self._scaler_cache.get(key)
+        if chunk is None:
+            chunk = AttrStringChunk(f"{ratio:6.1f}% ", color=color)
+            self._scaler_cache[key] = chunk
+        return chunk
 
     def scale_memory(
         self, memory: int, max_memory: float, active: bool = True

@@ -65,7 +65,9 @@ def _pid_cell(pid: int, color: int, selected: bool) -> AttrString:
     return astr
 
 
-def _cmdline_cell(proc: PythonProcess, palette: Palette, selected: bool) -> AttrString:
+def _cmdline_cell(
+    proc: PythonProcess, palette: Palette, selected: bool
+) -> AttrString:
     """Build a syntax-highlighted AttrString for a process command line.
 
     Colors:
@@ -83,8 +85,12 @@ def _cmdline_cell(proc: PythonProcess, palette: Palette, selected: bool) -> Attr
             if slash >= 0:
                 path_c = palette.get_color("proc_path")
                 exec_c = palette.get_color("proc_exec")
-                astr.append(AttrStringChunk(token[: slash + 1], path_c, False, selected))
-                astr.append(AttrStringChunk(token[slash + 1 :], exec_c, True, selected))
+                astr.append(
+                    AttrStringChunk(token[: slash + 1], path_c, False, selected)
+                )
+                astr.append(
+                    AttrStringChunk(token[slash + 1 :], exec_c, True, selected)
+                )
             else:
                 exec_c = palette.get_color("proc_exec")
                 astr.append(AttrStringChunk(token, exec_c, True, selected))
@@ -125,7 +131,11 @@ class PickerView(View):
             procs = [p for p in procs if "python" in p.name.lower()]
         if self._filter_text:
             query = self._filter_text.lower()
-            procs = [p for p in procs if query in " ".join(p.cmdline or [p.name]).lower()]
+            procs = [
+                p
+                for p in procs
+                if query in " ".join(p.cmdline or [p.name]).lower()
+            ]
         return procs
 
     def populate(self, processes: List[PythonProcess]) -> None:
@@ -137,7 +147,9 @@ class PickerView(View):
     def _refresh_filter_label(self) -> None:
         visible = self._filter_active or self._filter_text
         cursor = "_" if self._filter_active else ""
-        prefix = "  Filtering (ESC to cancel): " if self._filter_active else "  "
+        prefix = (
+            "  Filtering (ESC to cancel): " if self._filter_active else "  "
+        )
         text = f"{prefix}{self._filter_text}{cursor}" if visible else ""
         self.filter_text_lbl.set_text(text)  # type: ignore[attr-defined]
         self.filter_text_lbl.draw()  # type: ignore[attr-defined]
@@ -157,7 +169,9 @@ class PickerView(View):
         self.proc_table.draw()  # type: ignore[attr-defined]
         self.proc_scroll.refresh()  # type: ignore[attr-defined]
 
-    _FILTER_PASSTHROUGH = frozenset({"KEY_UP", "KEY_DOWN", "\n", "\r", "KEY_ENTER"})
+    _FILTER_PASSTHROUGH = frozenset(
+        {"KEY_UP", "KEY_DOWN", "\n", "\r", "KEY_ENTER"}
+    )
 
     async def _input_loop(self) -> None:
         try:
@@ -175,7 +189,10 @@ class PickerView(View):
 
                 try:
                     event = self.root_widget._win.getkey()
-                    if self._filter_active and event not in self._FILTER_PASSTHROUGH:
+                    if (
+                        self._filter_active
+                        and event not in self._FILTER_PASSTHROUGH
+                    ):
                         if event in ("KEY_BACKSPACE", "\x7f", "\b"):
                             self._filter_text = self._filter_text[:-1]
                         elif event == "\x1b":

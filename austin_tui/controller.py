@@ -25,6 +25,7 @@ import sys
 from enum import Enum
 from pathlib import Path
 from textwrap import wrap
+from time import monotonic
 from time import time
 from typing import Any
 from typing import Callable
@@ -66,6 +67,16 @@ class ThreadNav(Enum):
 
     PREV = -1
     NEXT = 1
+
+
+#: Interval between UI refresh ticks (seconds).
+UPDATE_INTERVAL = 0.05
+#: Maximum number of queued Austin events reduced in a single tick.
+REDUCER_BATCH = 1 << 12
+#: Maximum wall-clock time (seconds) spent reducing events in a single tick.
+REDUCER_BUDGET = 0.02
+#: Interactive latency budget for keyboard events: p95 must stay below it.
+INTERACTIVE_BUDGET = 0.1
 
 
 def _print(text: str) -> None:
@@ -125,10 +136,16 @@ class AustinTUIController:
         self._view_mode = AustinViewMode.LIVE
         self._scaler: Optional[Callable[..., Any]] = None
         self._formatter: Optional[Callable[..., Any]] = None
-        self._last_timestamp = 0
         self._update_task: Optional[asyncio.Task[None]] = None
         self._exception: Optional[Exception] = None
         self._file_mode = False
+
+        # Revision gating: the current thread view is rebuilt only when the
+        # data revision advanced with changes relevant to the current thread,
+        # or when a rebuild is explicitly forced (thread/mode/threshold).
+        self._pending_dirty: set[str] = set()
+        self._view_revision = -1
+        self._force_view = True
 
         view_builder = ViewBuilder.from_resource(
             "austin_tui.view", "tui.austinui"
@@ -141,7 +158,8 @@ class AustinTUIController:
 
         view_builder.autoconnect(self)
 
-        self.model.austin.mode = view.mode
+        self.model.metadata_callback = self._on_metadata_reduced
+        self.model.austin.set_mode(view.mode)
 
         # Auto-create adapters
         for name, adapter_class in (
@@ -151,34 +169,102 @@ class AustinTUIController:
         ):
             setattr(self, name, adapter_class(self.model, self.view))
 
-    def set_thread_data(self) -> None:
-        """Set the thread stack."""
-        if not self.model.austin.threads:
-            return
+    def set_thread_data(self) -> bool:
+        """Set the thread stack for the active revision.
+
+        Returns whether the underlying widget data actually changed.
+        """
+        if not self.model.active_austin.threads:
+            return False
 
         if self._view_mode is AustinViewMode.GRAPH:
-            self.flamegraph()  # type: ignore[call-arg]
+            return bool(self.flamegraph())  # type: ignore[call-arg]
         elif self._view_mode is AustinViewMode.FULL:
-            self.thread_full_data()  # type: ignore[call-arg]
+            return bool(self.thread_full_data())  # type: ignore[call-arg]
         elif self._view_mode is AustinViewMode.TOP:
-            self.thread_top_data()  # type: ignore[call-arg]
+            return bool(self.thread_top_data())  # type: ignore[call-arg]
         else:
-            self.thread_data()  # type: ignore[call-arg]
-
-        # self._last_timestamp = self.model.austin.stats.timestamp
+            return bool(self.thread_data())  # type: ignore[call-arg]
 
     def set_thread(self) -> bool:
         """Set the thread to display."""
         self.current_thread()  # type: ignore[call-arg]
         self.thread_name()
 
-        if not self.model.austin.threads:
-            return True
-
         # Populate the thread stack view
-        self.set_thread_data()
+        return self.set_thread_data()
 
-        return True
+    def _rebuild_view(self) -> bool:
+        """Rebuild the current thread view and mark the revision as rendered."""
+        changed = self.set_thread()
+
+        active = self.model.active_austin
+        if active.threads:
+            self._pending_dirty.discard(active.threads[active.current_thread])
+        self._view_revision = self.model.revision
+        self._force_view = False
+
+        return changed
+
+    def _render_view(self) -> None:
+        """Rebuild the active view and draw the visible data widget."""
+        self._rebuild_view()
+        if self._view_mode is AustinViewMode.GRAPH:
+            self.view.flamegraph.draw()
+            self.view.flame_view.refresh()
+        else:
+            self.view.table.draw()
+            self.view.stats_view.refresh()
+
+    def _tick(self) -> bool:
+        """Run one UI update cycle.
+
+        Reduce a bounded batch of queued events, refresh the cheap header
+        labels, and rebuild the (potentially expensive) thread view only when
+        the current revision brought changes relevant to the current thread.
+        """
+        result = self.model.reduce(
+            max_events=REDUCER_BATCH,
+            deadline=monotonic() + REDUCER_BUDGET,
+        )
+        self._pending_dirty.update(result.dirty)
+
+        if result.froze:
+            self._force_view = True
+
+        if self.model.frozen:
+            # The visible revision is sealed: nothing live can dirty it. The
+            # only transition that requires a rebuild is a resume commit.
+            if not result.resumed:
+                return False
+            self._force_view = True
+
+        if result.resumed:
+            self.view.notification.set_text("Resumed")
+
+        # System data
+        self.duration()
+        self.cpu()  # type: ignore[call-arg]
+        self.memory()  # type: ignore[call-arg]
+
+        # Samples count and thread indicators
+        self.samples()
+        self.current_thread()  # type: ignore[call-arg]
+        self.thread_name()
+
+        active = self.model.active_austin
+        if not active.threads:
+            return False
+
+        if not self._force_view:
+            current_key = active.threads[active.current_thread]
+            if (
+                self.model.revision == self._view_revision
+                or current_key not in self._pending_dirty
+            ):
+                return False
+
+        return self._rebuild_view()
 
     def _add_flamegraph_palette(self) -> None:
         colors = [196, 202, 214, 124, 160, 166, 208]
@@ -203,7 +289,9 @@ class AustinTUIController:
             await self.open_file(pargs.open)
             return
 
-        self.austin = AsyncAustin(self.on_sample, self.on_metadata, self.on_terminate)
+        self.austin = AsyncAustin(
+            self.on_sample, self.on_metadata, self.on_terminate
+        )
 
         await self.austin.start(args)
 
@@ -214,12 +302,14 @@ class AustinTUIController:
             (child_process,) = austin_process.children()
         command = child_process.cmdline()
 
-        mode = AustinProfileMode.MEMORY if pargs.memory else AustinProfileMode.TIME
+        mode = (
+            AustinProfileMode.MEMORY if pargs.memory else AustinProfileMode.TIME
+        )
         self.view.mode = mode
+        self.model.austin.set_mode(mode)
 
         """Austin ready callback."""
         self.model.system.set_child_process(child_process)
-        # self.model.austin.set_metadata(self._meta)
         self.model.austin.set_command_line(command)
 
         self._add_flamegraph_palette()
@@ -290,7 +380,8 @@ class AustinTUIController:
         )
 
         self.command_line()
-        self.update()
+        self.model.drain_all()
+        self._render_view()
 
         await self.stop()
 
@@ -319,24 +410,6 @@ class AustinTUIController:
 
         self.view.stop()
 
-    def update(self) -> bool:
-        """Update event."""
-        if self.model.frozen:
-            return False
-
-        # System data
-        self.duration()
-        self.cpu()  # type: ignore[call-arg]
-        self.memory()  # type: ignore[call-arg]
-
-        # Samples count
-        self.samples()
-
-        if self.model.austin.stats.timestamp > self._last_timestamp:
-            return self.set_thread()
-
-        return False
-
     async def update_loop(self) -> None:
         """The UI update loop."""
         try:
@@ -345,7 +418,7 @@ class AustinTUIController:
                 and self.view.is_open
                 and self.view.root_widget
             ):
-                if self.update():
+                if self._tick():
                     if self._view_mode is AustinViewMode.GRAPH:
                         self.view.flamegraph.draw()
                     else:
@@ -354,19 +427,15 @@ class AustinTUIController:
                 self.view.root_widget.refresh()
 
                 try:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(UPDATE_INTERVAL)
                 except asyncio.CancelledError:
                     break
         except Exception as exc:
             self.view.on_exception(exc)
 
     def _change_thread(self, direction: ThreadNav) -> bool:
-        """Change thread."""
-        austin = (
-            self.model.frozen_austin or self.model.austin
-            if self.model.frozen
-            else self.model.austin
-        )
+        """Change thread on the active (live or frozen) revision."""
+        austin = self.model.active_austin
         prev_index = austin.current_thread
 
         austin.current_thread = max(
@@ -378,7 +447,8 @@ class AustinTUIController:
         )
 
         if prev_index != austin.current_thread:
-            return self.set_thread()
+            self._force_view = True
+            return self._rebuild_view()
 
         return False
 
@@ -413,7 +483,7 @@ class AustinTUIController:
 
         self._view_mode = AustinViewMode.LIVE
         self.view.dataview_selector.select(0)
-        self.set_thread_data()
+        self._rebuild_view()
 
         self.view.table.draw()
         self.view.stats_view.refresh()
@@ -427,7 +497,7 @@ class AustinTUIController:
 
         self._view_mode = AustinViewMode.TOP
         self.view.dataview_selector.select(0)
-        self.set_thread_data()
+        self._rebuild_view()
 
         self.view.table.draw()
         self.view.stats_view.refresh()
@@ -441,7 +511,7 @@ class AustinTUIController:
 
         self._view_mode = AustinViewMode.FULL
         self.view.dataview_selector.select(0)
-        self.set_thread_data()
+        self._rebuild_view()
 
         self.view.table.draw()
         self.view.stats_view.refresh()
@@ -453,9 +523,7 @@ class AustinTUIController:
         if self._file_mode:
             self.view.notification.set_text("")
             return False
-        model = (
-            self.model.frozen_austin if self.model.frozen else self.model.austin
-        )
+        model = self.model.active_austin
 
         def _dump_stats() -> None:
             assert self.model.system.child_process is not None
@@ -485,31 +553,55 @@ class AustinTUIController:
         return False
 
     async def on_play_pause(self, _: Any = None) -> bool:
-        """On play/pause handler."""
+        """On play/pause handler.
+
+        Pausing seals the current revision in O(1) time (no deep copy) and the
+        screen is immediately refreshed from the sealed revision. Resuming is
+        requested here and committed atomically by the reducer once the event
+        queue is fully drained.
+        """
         if self.view._stopped:
             return False
 
-        self.model.toggle_freeze()
-        self.update()
-        self.view.notification.set_text(
-            "Paused" if self.model.frozen else "Resumed"
-        )
+        if self.model.frozen:
+            self.model.request_resume()
+            self.view.notification.set_text("Resuming ...")
+            return True
+
+        self.model.request_freeze()
+        # Commit the freeze immediately: seal + rotate is O(1) and events still
+        # queued naturally flow into the fresh live segment.
+        self.model.reduce(max_events=0)
+
+        # The sealed revision is the live one just sealed. The current view
+        # already shows it unless unrendered current-thread data is pending,
+        # in which case the screen catches up from the sealed revision.
+        sealed = self.model.active_austin
+        if self._force_view or (
+            sealed.threads
+            and sealed.threads[sealed.current_thread] in self._pending_dirty
+        ):
+            self._render_view()
+
+        self.view.notification.set_text("Paused")
         return True
 
     def _change_threshold(self, delta: float) -> float:
-        self.model.austin.threshold += delta
+        austin = self.model.active_austin
+        austin.threshold += delta
 
-        if self.model.austin.threshold < 0.0:
-            self.model.austin.threshold = 0.0
-        elif self.model.austin.threshold > 1.0:
-            self.model.austin.threshold = 1.0
+        if austin.threshold < 0.0:
+            austin.threshold = 0.0
+        elif austin.threshold > 1.0:
+            austin.threshold = 1.0
 
         if self.view._stopped or self.model.frozen:
-            self.set_thread_data()
+            self._force_view = True
+            self._rebuild_view()
             self.view.table.draw()
             self.view.table.refresh()
 
-        return self.model.austin.threshold
+        return austin.threshold
 
     async def on_threshold_up(self, _: Any = None) -> bool:
         """Handle threshold up."""
@@ -532,7 +624,7 @@ class AustinTUIController:
 
         self.view.dataview_selector.select(1)
 
-        self.flamegraph()  # type: ignore[call-arg]
+        self._rebuild_view()
 
         return True
 
@@ -560,11 +652,25 @@ class AustinTUIController:
     # Austin events
 
     async def on_sample(self, sample: AustinSample) -> None:
-        """Austin sample received callback."""
-        self.model.austin.update(sample)
+        """Austin sample received callback.
+
+        Samples are only enqueued; the expensive reduction happens in bounded
+        batches from the update loop so that keyboard handling stays
+        responsive and no sample is ever dropped.
+        """
+        self.model.submit(sample)
 
     async def on_metadata(self, metadata: AustinMetadata) -> None:
-        """Austin metadata received callback."""
+        """Austin metadata received callback.
+
+        Metadata is queued together with the samples so that it is always
+        applied *before* the samples that depend on it (e.g. the stats type
+        configured by the ``mode`` metadata).
+        """
+        self.model.submit(metadata)
+
+    def _on_metadata_reduced(self, metadata: AustinMetadata) -> None:
+        """Apply view/system side effects of metadata in queue order."""
         if metadata.name == "mode":
             self.view.set_mode(metadata.value)
         elif metadata.name == "python":

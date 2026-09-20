@@ -10,5 +10,3 @@ def override_argv(args):
         yield
     finally:
         sys.argv = original_argv
-
-
